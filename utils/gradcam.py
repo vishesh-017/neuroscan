@@ -1,93 +1,109 @@
- 
 """
-Grad-CAM for visualizing CNN decisions
+Explainable AI (XAI): Grad-CAM Implementation
+==============================================
+Gradient-weighted Class Activation Mapping for PyTorch CNNs.
+Visualizes which anatomical regions in the MRI scan drove the model's decision.
 """
 
+import cv2
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
-import cv2
 
-def generate_gradcam(model, image, target_layer):
+class GradCAM:
     """
-    Generate Grad-CAM heatmap
+    Grad-CAM implementation for interpreting convolutional neural network decisions.
+    """
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.gradients = None
+        self.activations = None
+        
+        # Register PyTorch forward & backward hooks
+        self.target_layer.register_forward_hook(self._forward_hook)
+        self.target_layer.register_full_backward_hook(self._backward_hook)
+
+    def _forward_hook(self, module, input, output):
+        self.activations = output
+
+    def _backward_hook(self, module, grad_input, grad_output):
+        self.gradients = grad_output[0]
+
+    def generate_heatmap(self, input_tensor, target_class=None):
+        """
+        Generates normalized Grad-CAM heatmap for a given input image tensor.
+        
+        Args:
+            input_tensor (torch.Tensor): Shape (1, C, H, W)
+            target_class (int, optional): Target class index. If None, uses top prediction.
+            
+        Returns:
+            heatmap (np.ndarray): 2D float array in [0, 1] of shape (H, W)
+        """
+        self.model.eval()
+        output = self.model(input_tensor)
+        
+        if target_class is None:
+            target_class = output.argmax(dim=1).item()
+            
+        # Zero gradients
+        self.model.zero_grad()
+        # Backward pass on target class score
+        score = output[0, target_class]
+        score.backward(retain_graph=True)
+        
+        # Global Average Pooling of gradients to calculate channel weights alpha_k
+        # gradients shape: (1, channels, h, w)
+        grads = self.gradients.detach().cpu().numpy()[0]
+        acts = self.activations.detach().cpu().numpy()[0]
+        
+        weights = np.mean(grads, axis=(1, 2))  # (channels,)
+        
+        # Weighted sum of feature maps
+        cam = np.zeros(acts.shape[1:], dtype=np.float32)
+        for i, w in enumerate(weights):
+            cam += w * acts[i]
+            
+        # Apply ReLU: only positive contributions matter for the selected class
+        cam = np.maximum(cam, 0)
+        
+        # Resize to input tensor size
+        h, w = input_tensor.shape[2], input_tensor.shape[3]
+        cam = cv2.resize(cam, (w, h))
+        
+        # Normalize between 0 and 1
+        denom = (cam.max() - cam.min()) + 1e-8
+        cam = (cam - cam.min()) / denom
+        return cam, target_class
+
+
+def overlay_gradcam(original_rgb_np, heatmap, alpha=0.45):
+    """
+    Overlays a Grad-CAM heatmap onto the original RGB image using JET colormap.
     
     Args:
-        model: trained PyTorch model
-        image: input tensor (1, C, H, W)
-        target_layer: layer to visualize (e.g., model.features[-1])
-    
+        original_rgb_np (np.ndarray): RGB image in [0, 1] or [0, 255]
+        heatmap (np.ndarray): 2D float heatmap in [0, 1]
+        alpha (float): Opacity of heatmap (0.0 to 1.0)
+        
     Returns:
-        heatmap: numpy array (H, W)
+        overlaid_rgb (np.ndarray): RGB image in uint8 [0, 255]
     """
-    # Store gradients and activations
-    gradients = []
-    activations = []
+    if original_rgb_np.max() <= 1.0:
+        base_img = (original_rgb_np * 255).astype(np.uint8)
+    else:
+        base_img = original_rgb_np.astype(np.uint8)
+        
+    # Apply JET colormap: red = high focus, blue = low focus
+    heatmap_uint8 = np.uint8(255 * heatmap)
+    colored_heatmap = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+    colored_heatmap = cv2.cvtColor(colored_heatmap, cv2.COLOR_BGR2RGB)
     
-    def backward_hook(module, grad_input, grad_output):
-        gradients.append(grad_output[0])
-    
-    def forward_hook(module, input, output):
-        activations.append(output)
-    
-    # Register hooks
-    handle_forward = target_layer.register_forward_hook(forward_hook)
-    handle_backward = target_layer.register_full_backward_hook(backward_hook)
-    
-    # Forward pass
-    model.eval()
-    output = model(image)
-    pred_class = output.argmax(dim=1)
-    
-    # Backward pass
-    model.zero_grad()
-    class_loss = output[0, pred_class]
-    class_loss.backward()
-    
-    # Get gradients and activations
-    grad = gradients[0].cpu().data.numpy()[0]
-    act = activations[0].cpu().data.numpy()[0]
-    
-    # Compute weights
-    weights = np.mean(grad, axis=(1, 2))
-    
-    # Weighted combination
-    cam = np.zeros(act.shape[1:], dtype=np.float32)
-    for i, w in enumerate(weights):
-        cam += w * act[i]
-    
-    # ReLU and normalize
-    cam = np.maximum(cam, 0)
-    cam = cv2.resize(cam, (224, 224))
-    cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
-    
-    # Remove hooks
-    handle_forward.remove()
-    handle_backward.remove()
-    
-    return cam
-
-def overlay_heatmap(image, heatmap, alpha=0.4):
-    """
-    Overlay heatmap on original image
-    
-    Args:
-        image: original image (H, W, 3) - numpy array
-        heatmap: Grad-CAM heatmap (H, W)
-        alpha: transparency of heatmap
-    
-    Returns:
-        overlaid image
-    """
-    # Convert heatmap to RGB
-    heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap), cv2.COLORMAP_JET)
-    heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
-    
-    # Ensure image is uint8
-    if image.max() <= 1.0:
-        image = (image * 255).astype(np.uint8)
-    
-    # Overlay
-    overlaid = cv2.addWeighted(image, 1-alpha, heatmap_colored, alpha, 0)
-    
-    return overlaid
+    # Resize colormap if needed
+    if colored_heatmap.shape[:2] != base_img.shape[:2]:
+        colored_heatmap = cv2.resize(colored_heatmap, (base_img.shape[1], base_img.shape[0]))
+        
+    # Blend images
+    blended = cv2.addWeighted(base_img, 1.0 - alpha, colored_heatmap, alpha, 0)
+    return blended

@@ -1,4 +1,0 @@
-Model,Architecture,Parameters,Test Accuracy,Use Case,Training Time
-Multi-Class,MobileNetV2,"2,228,996",0.8419,Tumor Type Classification,~70 min
-Binary,ImprovedCNN,"8,844,418",0.8214,Tumor Detection,~20 min
-SoftMax Aggregation,MobileNetV2,"2,228,996",0.4413,Cross-Dataset Detection,N/A (reuses model)

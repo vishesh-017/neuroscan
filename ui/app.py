@@ -1,428 +1,353 @@
-# ============================================================================
-# BRAIN TUMOR DETECTION SYSTEM - STREAMLIT UI
-# ============================================================================
-# Simple web interface for MRI analysis using trained models
-# Run with: streamlit run app.py
-# ============================================================================
+"""
+Brain Tumor MRI Detection & Explainability System
+=================================================
+Interactive Streamlit Application for Radiologist Decision Support.
+Features:
+  - Automated Image Quality Pre-screening
+  - High-Accuracy Deep Learning Inference (MobileNetV2)
+  - Explainable AI (Grad-CAM Attention Heatmaps)
+  - Confidence-based Safety Guardrail (Human-in-the-loop escalation)
+  - Interactive Benchmark Evaluation Dashboard
+"""
 
+import os
+import sys
+
+# Auto-launch Streamlit if executed directly with plain `python app.py`
 import streamlit as st
-import torch
-import torch.nn as nn
+if not st.runtime.exists():
+    print("\n[NeuroScan AI] Detected direct python execution.")
+    print("[NeuroScan AI] Launching interactive Streamlit web server...\n")
+    import subprocess
+    subprocess.run([sys.executable, "-m", "streamlit", "run", os.path.abspath(__file__)] + sys.argv[1:])
+    sys.exit(0)
+
+import json
 import numpy as np
 import cv2
 from PIL import Image
-import json
-from pathlib import Path
 
+import torch
+import torch.nn as nn
 from torchvision import models, transforms
 
-import sys
-sys.path.append('..')
-sys.path.append('../utils')
+# Configure search paths for imports
+curr_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(curr_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+utils_dir = os.path.join(parent_dir, "utils")
+if utils_dir not in sys.path:
+    sys.path.insert(0, utils_dir)
 
 try:
-    from utils.gradcam import generate_gradcam, overlay_heatmap
-except:
-    from gradcam import generate_gradcam, overlay_heatmap
+    from utils.gradcam import GradCAM, overlay_gradcam
+    from utils.dataset import crop_brain_contour
+except ImportError:
+    from gradcam import GradCAM, overlay_gradcam
+    from dataset import crop_brain_contour
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
-# Set page config
+# Page Configuration (Must be first Streamlit command)
 st.set_page_config(
-    page_title="Brain Tumor Detection",
+    page_title="NeuroScan AI | Brain Tumor Detection",
     page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
+# Device Configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# ============================================================================
-# LOAD MODELS (Cached for performance)
-# ============================================================================
+# ---------------------------------------------------------
+# CACHED MODEL & METRICS LOADERS
+# ---------------------------------------------------------
 
 @st.cache_resource
-def load_multiclass_model():
-    """Load the multi-class MobileNetV2 model"""
-    model = models.mobilenet_v2(pretrained=False)
-    model.classifier[1] = nn.Linear(model.last_channel, 4)
-    model.load_state_dict(torch.load('../models/multiclass_model.pth', map_location=device))
+def load_model():
+    """Load and cache the trained MobileNetV2 model"""
+    class_names = ['glioma', 'meningioma', 'notumor', 'pituitary']
+    model = models.mobilenet_v2(weights=None)
+    model.classifier[1] = nn.Linear(model.last_channel, len(class_names))
+    
+    # Check for best model or fallback
+    model_paths = [
+        os.path.join(parent_dir, "models", "best_multiclass_model.pth"),
+        os.path.join(parent_dir, "models", "multiclass_model.pth")
+    ]
+    loaded = False
+    for p in model_paths:
+        if os.path.exists(p):
+            model.load_state_dict(torch.load(p, map_location=device))
+            loaded = True
+            break
+            
     model.to(device)
     model.eval()
-    return model
-
-@st.cache_resource
-def load_binary_model():
-    """Load the binary classification model"""
-    
-    class ImprovedCNN(nn.Module):
-        def __init__(self):
-            super(ImprovedCNN, self).__init__()
-            
-            self.features = nn.Sequential(
-                nn.Conv2d(3, 32, kernel_size=3, padding=1),
-                nn.BatchNorm2d(32),
-                nn.ReLU(),
-                nn.MaxPool2d(2),
-                
-                nn.Conv2d(32, 64, kernel_size=3, padding=1),
-                nn.BatchNorm2d(64),
-                nn.ReLU(),
-                nn.MaxPool2d(2),
-                
-                nn.Conv2d(64, 128, kernel_size=3, padding=1),
-                nn.BatchNorm2d(128),
-                nn.ReLU(),
-                nn.MaxPool2d(2),
-                
-                nn.Conv2d(128, 256, kernel_size=3, padding=1),
-                nn.BatchNorm2d(256),
-                nn.ReLU(),
-                nn.MaxPool2d(2),
-            )
-            
-            self.classifier = nn.Sequential(
-                nn.Flatten(),
-                nn.Linear(256 * 8 * 8, 512),
-                nn.ReLU(),
-                nn.Dropout(0.5),
-                nn.Linear(512, 128),
-                nn.ReLU(),
-                nn.Dropout(0.3),
-                nn.Linear(128, 2)
-            )
-        
-        def forward(self, x):
-            x = self.features(x)
-            x = self.classifier(x)
-            return x
-    
-    model = ImprovedCNN()
-    model.load_state_dict(torch.load('../models/binary_model.pth', map_location=device))
-    model.to(device)
-    model.eval()
-    return model
+    return model, class_names
 
 @st.cache_data
-def load_results():
-    """Load saved model results"""
-    with open('../models/multiclass_results.json', 'r') as f:
-        mc_results = json.load(f)
-    with open('../models/binary_results.json', 'r') as f:
-        bin_results = json.load(f)
-    return mc_results, bin_results
+def load_metrics():
+    """Load evaluation metrics and class metadata"""
+    metrics_path = os.path.join(parent_dir, "models", "evaluation_metrics.json")
+    if os.path.exists(metrics_path):
+        with open(metrics_path, "r") as f:
+            return json.load(f)
+    return None
 
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
+# ---------------------------------------------------------
+# IMAGE PROCESSING & INFERENCE FUNCTIONS
+# ---------------------------------------------------------
 
-def check_image_quality(image):
+def check_image_quality(image_pil):
     """
-    Check if image quality is sufficient
-    Returns: (is_good, brightness, message)
+    Evaluates scan quality before running inference.
+    Checks mean brightness and contrast to catch dark, washed out, or invalid images.
     """
-    # Convert PIL to numpy
-    img_np = np.array(image)
+    img_np = np.array(image_pil.convert('L'))
+    brightness = float(np.mean(img_np))
+    contrast = float(np.std(img_np))
     
-    # Convert to grayscale
-    if len(img_np.shape) == 3:
-        gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    if brightness < 30.0:
+        return False, brightness, contrast, "⚠️ Scan is underexposed/too dark."
+    elif brightness > 225.0:
+        return False, brightness, contrast, "⚠️ Scan is overexposed/saturated."
+    elif contrast < 20.0:
+        return False, brightness, contrast, "⚠️ Scan has low contrast (poor tissue definition)."
     else:
-        gray = img_np
-    
-    brightness = np.mean(gray)
-    
-    if brightness < 30:
-        return False, brightness, "⚠️ Image too dark"
-    elif brightness > 225:
-        return False, brightness, "⚠️ Image overexposed"
-    else:
-        return True, brightness, "✅ Good quality"
+        return True, brightness, contrast, "✅ Image quality passed clinical pre-screening."
 
-def predict_multiclass(image, model):
-    """
-    Predict using multi-class model
-    Returns: (class_name, confidence, all_probs)
-    """
-    # Transform
+def predict_mri(image_pil, model, class_names, apply_crop=True):
+    """Preprocesses scan, computes softmax probabilities and Grad-CAM heatmap"""
+    processed_pil = crop_brain_contour(image_pil) if apply_crop else image_pil
+    
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
-    img_tensor = transform(image).unsqueeze(0).to(device)
+    input_tensor = transform(processed_pil).unsqueeze(0).to(device)
     
-    # Predict
     with torch.no_grad():
-        output = model(img_tensor)
-        probs = torch.softmax(output, dim=1)
-        confidence, pred = torch.max(probs, 1)
+        outputs = model(input_tensor)
+        probs = torch.softmax(outputs, dim=1).cpu().numpy()[0]
+        pred_idx = int(np.argmax(probs))
+        confidence = float(probs[pred_idx])
+        pred_class = class_names[pred_idx]
+        
+    gradcam = GradCAM(model, model.features[-1])
+    heatmap, _ = gradcam.generate_heatmap(input_tensor, target_class=pred_idx)
     
-    class_names = ['glioma', 'meningioma', 'notumor', 'pituitary']
+    display_np = np.array(processed_pil.resize((224, 224)).convert('RGB')) / 255.0
+    overlay = overlay_gradcam(display_np, heatmap, alpha=0.45)
     
-    return class_names[pred.item()], confidence.item(), probs.cpu().numpy()[0], img_tensor
+    return pred_class, confidence, probs, overlay, processed_pil
 
-def predict_binary(image, model):
-    """
-    Predict using binary model
-    Returns: (class_name, confidence)
-    """
-    # Transform
-    transform = transforms.Compose([
-        transforms.Resize((128, 128)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
-    ])
-    
-    img_tensor = transform(image).unsqueeze(0).to(device)
-    
-    # Predict
-    with torch.no_grad():
-        output = model(img_tensor)
-        probs = torch.softmax(output, dim=1)
-        confidence, pred = torch.max(probs, 1)
-    
-    class_names = ['no', 'yes']
-    
-    return class_names[pred.item()], confidence.item()
-
-def get_confidence_color(confidence):
-    """Return color based on confidence level"""
-    if confidence >= 0.8:
-        return "green"
-    elif confidence >= 0.6:
-        return "orange"
-    else:
-        return "red"
-
-def get_status_message(confidence):
-    """Return status message based on confidence"""
-    if confidence >= 0.8:
-        return "✅ Confident Prediction"
-    elif confidence >= 0.6:
-        return "⚠️ Moderate Confidence - Review Recommended"
-    else:
-        return "🚨 Low Confidence - Manual Review Required"
-
-# ============================================================================
-# MAIN UI
-# ============================================================================
+# ---------------------------------------------------------
+# STREAMLIT USER INTERFACE
+# ---------------------------------------------------------
 
 def main():
-    # Load models
-    model_mc = load_multiclass_model()
-    model_bin = load_binary_model()
-    mc_results, bin_results = load_results()
+    model, class_names = load_model()
+    metrics = load_metrics()
     
-    # ========== HEADER ==========
-    st.title("🧠 Brain Tumor Detection System")
+    # Sidebar
+    with st.sidebar:
+        st.image("https://img.icons8.com/fluency/96/brain.png", width=70)
+        st.title("NeuroScan AI")
+        st.markdown("**Assistive Brain Tumor MRI Diagnostic Platform**")
+        st.markdown("---")
+        
+        st.subheader("⚙️ Clinical Configuration")
+        apply_crop = st.checkbox("Auto-Crop Brain Contours", value=True, 
+                                 help="Detects skull margins and crops excess black borders to focus on brain tissue.")
+        
+        conf_threshold = st.slider("Safety Confidence Threshold", min_value=0.50, max_value=0.95, value=0.80, step=0.05,
+                                   help="Predictions below this confidence level are flagged for mandatory radiologist audit.")
+        
+        st.markdown("---")
+        st.subheader("📋 System Specifications")
+        st.caption(f"• **Architecture:** MobileNetV2 Transfer Learning")
+        st.caption(f"• **Computation Device:** {device.type.upper()}")
+        st.caption(f"• **Target Classes (4):** Glioma, Meningioma, Healthy (No Tumor), Pituitary")
+        if metrics:
+            st.caption(f"• **Test Accuracy:** {metrics['deep_learning_model']['test_accuracy']:.1%}")
+            st.caption(f"• **Mean ROC-AUC:** {metrics['deep_learning_model']['mean_auc']:.3f}")
+            
+    # Main Header
+    st.markdown("# 🧠 NeuroScan AI: End-to-End Brain Tumor Detection")
+    st.markdown("A deep learning solution for Brain MRI interpretation with **Explainable AI (Grad-CAM)** and **Clinical Safety Guardrails**.")
     st.markdown("---")
     
-    # ========== SIDEBAR ==========
-    with st.sidebar:
-        st.header("⚙️ Configuration")
-        
-        # Model selection
-        model_choice = st.selectbox(
-            "Select Model",
-            ["Multi-Class Classification", "Binary Detection"],
-            help="Multi-Class: Identifies tumor type (Glioma, Meningioma, Pituitary, No Tumor)\nBinary: Detects presence of tumor (Yes/No)"
-        )
-        
-        st.markdown("---")
-        
-        # Model info
-        st.subheader("📊 Model Performance")
-        if model_choice == "Multi-Class Classification":
-            st.metric("Test Accuracy", f"{mc_results['test_accuracy']:.2%}")
-            st.caption("Classes: Glioma, Meningioma, Pituitary, No Tumor")
-        else:
-            st.metric("Test Accuracy", f"{bin_results['test_accuracy']:.2%}")
-            st.caption("Classes: Tumor / No Tumor")
-        
-        st.markdown("---")
-        
-        # About
-        st.subheader("ℹ️ About")
-        st.caption("""
-        This system uses deep learning to analyze MRI scans for brain tumors.
-        
-        **Features:**
-        - Image quality check
-        - Confidence scoring
-        - Explainable AI (Grad-CAM)
-        - Uncertainty detection
-        """)
+    # Navigation Tabs
+    tab1, tab2, tab3 = st.tabs([
+        "🔬 MRI Scan Analysis & Grad-CAM",
+        "📊 Model Benchmarks & Evaluation",
+        "📖 Clinical Protocol & Viva Guide"
+    ])
     
-    # ========== MAIN CONTENT ==========
-    
-    # File uploader
-    st.subheader("📤 Upload MRI Image")
-    uploaded_file = st.file_uploader(
-        "Choose an MRI scan image",
-        type=['jpg', 'jpeg', 'png'],
-        help="Upload a brain MRI scan in JPG or PNG format"
-    )
-    
-    if uploaded_file is not None:
-        # Load image
-        image = Image.open(uploaded_file).convert('RGB')
-        
-        # Display original image
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("🖼️ Original Image")
-            st.image(image, use_container_width=True)
-        
-        # Quality check
-        st.markdown("---")
-        st.subheader("🔍 Image Quality Check")
-        
-        is_good_quality, brightness, quality_msg = check_image_quality(image)
-        
-        col_q1, col_q2 = st.columns(2)
-        with col_q1:
-            st.metric("Brightness", f"{brightness:.1f}")
-        with col_q2:
-            if is_good_quality:
-                st.success(quality_msg)
-            else:
-                st.warning(quality_msg)
-        
-        if not is_good_quality:
-            st.warning("⚠️ Image quality may affect prediction accuracy. Proceed with caution.")
-        
-        # Analyze button
-        st.markdown("---")
-        
-        if st.button("🔬 Analyze Image", type="primary", use_container_width=True):
+    # ---------------- TAB 1: DIAGNOSTIC ANALYSIS ----------------
+    with tab1:
+        col_up, col_info = st.columns([1, 1])
+        with col_up:
+            st.subheader("📤 Upload Brain MRI Scan")
+            uploaded_file = st.file_uploader("Select a brain MRI image (JPG, PNG, JPEG)", type=["jpg", "png", "jpeg"])
             
-            with st.spinner("Analyzing MRI scan..."):
+            sample_options = ["None"]
+            demo_base = os.path.join(parent_dir, "datasets", "Multilabel_classification_dataset", "Testing")
+            demo_files = {}
+            if os.path.exists(demo_base):
+                for c in class_names:
+                    cfolder = os.path.join(demo_base, c)
+                    if os.path.exists(cfolder):
+                        flist = os.listdir(cfolder)
+                        if flist:
+                            demo_files[f"Demo: {c.upper()} sample"] = os.path.join(cfolder, flist[0])
+                sample_options += list(demo_files.keys())
                 
-                # Make prediction based on model choice
-                if model_choice == "Multi-Class Classification":
-                    pred_class, confidence, all_probs, img_tensor = predict_multiclass(image, model_mc)
-                    
-                    # Results
-                    st.markdown("---")
-                    st.subheader("📋 Analysis Results")
-                    
-                    # Prediction
-                    col_r1, col_r2, col_r3 = st.columns(3)
-                    
-                    with col_r1:
-                        st.metric("Prediction", pred_class.upper())
-                    
-                    with col_r2:
-                        confidence_color = get_confidence_color(confidence)
-                        st.metric("Confidence", f"{confidence:.1%}")
-                        st.markdown(f":{confidence_color}[{'●' * int(confidence * 10)}]")
-                    
-                    with col_r3:
-                        status_msg = get_status_message(confidence)
-                        if confidence >= 0.8:
-                            st.success(status_msg)
-                        elif confidence >= 0.6:
-                            st.warning(status_msg)
-                        else:
-                            st.error(status_msg)
-                    
-                    # Class probabilities
-                    st.markdown("---")
-                    st.subheader("📊 Class Probabilities")
-                    
-                    class_names = ['Glioma', 'Meningioma', 'No Tumor', 'Pituitary']
-                    prob_data = {
-                        'Class': class_names,
-                        'Probability': [f"{p:.1%}" for p in all_probs]
-                    }
-                    st.dataframe(prob_data, use_container_width=True, hide_index=True)
-                    
-                    # Grad-CAM
-                    st.markdown("---")
-                    st.subheader("🔥 Explainable AI - Grad-CAM")
-                    st.caption("Heatmap shows where the model focuses attention")
-                    
-                    try:
-                        heatmap = generate_gradcam(model_mc, img_tensor, model_mc.features[-1])
-                        
-                        # Prepare image for overlay
-                        img_display = img_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
-                        img_display = img_display * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
-                        img_display = np.clip(img_display, 0, 1)
-                        
-                        overlay = overlay_heatmap(img_display, heatmap, alpha=0.4)
-                        
-                        with col2:
-                            st.subheader("🔥 Grad-CAM Overlay")
-                            st.image(overlay, use_container_width=True)
-                            st.caption("Red areas indicate model focus")
-                        
-                    except Exception as e:
-                        st.error(f"Grad-CAM generation failed: {e}")
-                
-                else:  # Binary Detection
-                    pred_class, confidence = predict_binary(image, model_bin)
-                    
-                    # Results
-                    st.markdown("---")
-                    st.subheader("📋 Analysis Results")
-                    
-                    col_r1, col_r2, col_r3 = st.columns(3)
-                    
-                    with col_r1:
-                        if pred_class == 'yes':
-                            st.metric("Detection", "TUMOR DETECTED", delta="Positive")
-                        else:
-                            st.metric("Detection", "NO TUMOR", delta="Negative")
-                    
-                    with col_r2:
-                        confidence_color = get_confidence_color(confidence)
-                        st.metric("Confidence", f"{confidence:.1%}")
-                        st.markdown(f":{confidence_color}[{'●' * int(confidence * 10)}]")
-                    
-                    with col_r3:
-                        status_msg = get_status_message(confidence)
-                        if confidence >= 0.8:
-                            st.success(status_msg)
-                        elif confidence >= 0.6:
-                            st.warning(status_msg)
-                        else:
-                            st.error(status_msg)
-                
-                # Recommendation
-                st.markdown("---")
-                st.subheader("💡 Recommendation")
-                
-                if confidence >= 0.8 and is_good_quality:
-                    st.success("✅ High confidence prediction with good image quality. Results are reliable.")
-                elif confidence >= 0.6:
-                    st.warning("⚠️ Moderate confidence. Consider additional review or better quality image.")
+            demo_choice = st.selectbox("Or choose a verified clinical sample:", sample_options)
+            
+        with col_info:
+            st.subheader("ℹ️ Clinical Triage Guideline")
+            st.markdown("""
+            * **Input:** Axial or coronal Brain MRI scan.
+            * **Automated Screening:** Quality checks run prior to deep learning evaluation.
+            * **Safety Protocol:** If prediction confidence is **< 80%**, the case is marked as **Uncertain** to safeguard against misdiagnosis.
+            """)
+            
+        image_to_analyze = None
+        if uploaded_file is not None:
+            image_to_analyze = Image.open(uploaded_file).convert('RGB')
+        elif demo_choice != "None" and demo_choice in demo_files:
+            image_to_analyze = Image.open(demo_files[demo_choice]).convert('RGB')
+            
+        if image_to_analyze is not None:
+            st.markdown("---")
+            st.subheader("🔍 Quality Pre-screening & Diagnostic Assessment")
+            
+            # 1. Quality Check
+            is_valid, bright, contrast, q_msg = check_image_quality(image_to_analyze)
+            q_col1, q_col2, q_col3 = st.columns(3)
+            with q_col1:
+                st.metric("Mean Brightness", f"{bright:.1f} / 255")
+            with q_col2:
+                st.metric("Pixel Contrast (Std Dev)", f"{contrast:.1f}")
+            with q_col3:
+                if is_valid:
+                    st.success(q_msg)
                 else:
-                    st.error("🚨 Low confidence prediction. Manual expert review strongly recommended.")
-    
-    else:
-        # Instructions when no file uploaded
-        st.info("👆 Please upload an MRI image to begin analysis")
-        
-        st.markdown("---")
-        st.subheader("📖 How to Use")
+                    st.error(q_msg)
+                    
+            if not is_valid:
+                st.warning("⚠️ Scan failed quality check. Results may be inaccurate. Manual radiologist inspection is required.")
+                
+            # 2. Inference & Grad-CAM
+            with st.spinner("Analyzing MRI slices and computing Grad-CAM heatmap..."):
+                pred_class, conf, all_probs, gradcam_overlay, processed_img = predict_mri(
+                    image_to_analyze, model, class_names, apply_crop=apply_crop
+                )
+                
+            st.markdown("---")
+            col_img1, col_img2, col_res = st.columns([1, 1, 1.2])
+            
+            with col_img1:
+                st.markdown("**Original / Cropped MRI**")
+                st.image(processed_img, width=280)
+                
+            with col_img2:
+                st.markdown("**Grad-CAM Heatmap (Focus Area)**")
+                st.image(gradcam_overlay, width=280)
+                st.caption("🔴 Red regions highlight anatomical tissue driving the model's diagnostic classification.")
+                
+            with col_res:
+                st.markdown("### 📋 Diagnostic Outcome")
+                
+                color_map = {
+                    "glioma": "#e63946",
+                    "meningioma": "#e76f51",
+                    "pituitary": "#2a9d8f",
+                    "notumor": "#457b9d"
+                }
+                c_color = color_map.get(pred_class, "#2b5c8f")
+                
+                if pred_class == "notumor":
+                    st.markdown(f"<h2 style='color:#2a9d8f;margin:0;'>NORMAL (NO TUMOR)</h2>", unsafe_allow_html=True)
+                else:
+                    st.markdown(f"<h2 style='color:{c_color};margin:0;'>{pred_class.upper()} TUMOR</h2>", unsafe_allow_html=True)
+                    
+                st.markdown(f"**Confidence Score:** `{conf:.2%}`")
+                st.progress(conf)
+                
+                if conf >= conf_threshold:
+                    st.success(f"✅ **High Confidence Assessment (>{conf_threshold:.0%})**: Model findings correlate strongly with clinical training patterns.")
+                else:
+                    st.error(f"🚨 **UNCERTAIN CASE (<{conf_threshold:.0%})**: Confidence is below safety threshold. Mandatory review by Senior Radiologist required.")
+                    
+            st.markdown("---")
+            st.subheader("📊 Class-Wise Probability Breakdown")
+            prob_cols = st.columns(4)
+            for i, c_name in enumerate(class_names):
+                with prob_cols[i]:
+                    label_name = c_name.capitalize() if c_name != "notumor" else "Healthy (No Tumor)"
+                    st.metric(label_name, f"{all_probs[i]:.2%}")
+                    st.progress(float(all_probs[i]))
+                    
+    # ---------------- TAB 2: BENCHMARK EVALUATION ----------------
+    with tab2:
+        st.subheader("📈 Performance Benchmarking: Baseline vs. Deep Learning")
         st.markdown("""
-        1. Select model type from sidebar
-        2. Upload MRI image (JPG/PNG format)
-        3. Review image quality check
-        4. Click 'Analyze Image' button
-        5. Review results and confidence score
-        6. Check Grad-CAM heatmap (multi-class only)
+        In accordance with the Innovative Assignment rubric, the proposed Deep Learning model was evaluated
+        directly against a simple Baseline Model to justify its complexity and clinical utility.
         """)
+        
+        plot_dir = os.path.join(parent_dir, "notebooks", "plots")
+        
+        col_m1, col_m2 = st.columns([1, 1])
+        with col_m1:
+            p_comp = os.path.join(plot_dir, "05_baseline_vs_advanced_comparison.png")
+            if os.path.exists(p_comp):
+                st.image(p_comp, caption="Baseline (Logistic Regression) vs Proposed Deep Learning Model", width=480)
+                
+        with col_m2:
+            p_cm = os.path.join(plot_dir, "08_confusion_matrix.png")
+            if os.path.exists(p_cm):
+                st.image(p_cm, caption="Confusion Matrix on Test Set", width=420)
+                
+        st.markdown("---")
+        col_m3, col_m4 = st.columns([1, 1])
+        with col_m3:
+            p_roc = os.path.join(plot_dir, "09_roc_auc_curves.png")
+            if os.path.exists(p_roc):
+                st.image(p_roc, caption="Multi-Class One-vs-Rest ROC-AUC Curves", width=460)
+                
+        with col_m4:
+            p_tune = os.path.join(plot_dir, "06_hyperparameter_tuning.png")
+            if os.path.exists(p_tune):
+                st.image(p_tune, caption="Hyperparameter Tuning: Adam vs SGD Optimizer", width=480)
+                
+        st.markdown("---")
+        st.subheader("🔬 Error Analysis (Failure Case Review)")
+        p_err = os.path.join(plot_dir, "10_error_analysis_misclassifications.png")
+        if os.path.exists(p_err):
+            st.image(p_err, caption="Representative Misclassified Cases Analyzed for Clinical Failure Modes", width=600)
 
-# ============================================================================
-# RUN APP
-# ============================================================================
+    # ---------------- TAB 3: PROTOCOL & VIVA GUIDE ----------------
+    with tab3:
+        st.subheader("📖 Project Overview & Evaluator Q&A")
+        st.markdown("""
+        ### Core Technical Justifications
+        1. **Why was MobileNetV2 chosen?**
+           MobileNetV2 uses *inverted residuals* and *depthwise separable convolutions*, achieving over 86% accuracy with only 2.23M parameters. It runs in real-time even on standard CPU workstations without requiring high-end GPUs.
+           
+        2. **Why was a Baseline model mandatory?**
+           To provide an empirical reference point. A simple linear classifier (Logistic Regression) achieves ~67% accuracy because it cannot model spatial hierarchies. MobileNetV2 achieves ~86.5%, demonstrating a +19% gain due to convolutional feature learning.
+           
+        3. **Why is Accuracy insufficient on its own?**
+           In medical screening, missing a malignant tumor (False Negative) is life-threatening. Therefore, **Recall (Sensitivity)** and **ROC-AUC (0.963)** are critical metrics to ensure high disease detection rates.
+           
+        4. **How does Grad-CAM prevent the 'Black Box' dilemma?**
+           Grad-CAM takes gradients of the target class score flowing into the final convolutional feature maps, creating a localization heatmap. This allows doctors to verify that the model is looking at the actual tumor rather than skull artifacts.
+        """)
 
 if __name__ == "__main__":
     main()

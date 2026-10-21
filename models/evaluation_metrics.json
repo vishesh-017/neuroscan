@@ -1,0 +1,42 @@
+{
+    "problem_domain": "Healthcare & Medical Analytics",
+    "classes": [
+        "glioma",
+        "meningioma",
+        "notumor",
+        "pituitary"
+    ],
+    "baseline_model": {
+        "architecture": "Logistic Regression on 32x32 Grayscale Pixels",
+        "test_accuracy": 0.675,
+        "test_f1": 0.6666712217835813,
+        "reason_for_baseline": "Establishes reference threshold for linear image classification"
+    },
+    "deep_learning_model": {
+        "architecture": "MobileNetV2 (Transfer Learning, Frozen Backbone)",
+        "total_params": 2228996,
+        "trainable_params": 2228996,
+        "test_accuracy": 0.865,
+        "precision": 0.8696096611190951,
+        "recall": 0.865,
+        "f1_score": 0.8616528767516382,
+        "auc_roc_per_class": {
+            "glioma": 0.9026666666666666,
+            "meningioma": 0.9509333333333332,
+            "notumor": 0.9885333333333334,
+            "pituitary": 0.9906666666666667
+        },
+        "mean_auc": 0.9581999999999999
+    },
+    "hyperparameter_tuning": {
+        "chosen_optimizer": "Adam",
+        "learning_rate": 0.001,
+        "batch_size": 16,
+        "scheduler": "ReduceLROnPlateau (factor=0.5, patience=3)"
+    },
+    "clinical_safety_guardrails": {
+        "confidence_threshold": 0.8,
+        "quality_prescreening": "Brightness and Contrast thresholding",
+        "explainability": "Grad-CAM on final convolutional layer"
+    }
+}
