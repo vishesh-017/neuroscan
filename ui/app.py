@@ -40,12 +40,8 @@ utils_dir = os.path.join(parent_dir, "utils")
 if utils_dir not in sys.path:
     sys.path.insert(0, utils_dir)
 
-try:
-    from utils.gradcam import GradCAM, overlay_gradcam
-    from utils.dataset import crop_brain_contour
-except ImportError:
-    from gradcam import GradCAM, overlay_gradcam
-    from dataset import crop_brain_contour
+from utils.gradcam import GradCAM, overlay_gradcam
+from utils.dataset import crop_brain_contour
 
 # Page Configuration (Must be first Streamlit command)
 st.set_page_config(
