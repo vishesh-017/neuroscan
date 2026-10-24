@@ -101,6 +101,10 @@ Brain-Tumor-MRI-Detection/
 │       ├── 09_roc_auc_curves.png
 │       ├── 10_error_analysis_misclassifications.png
 │       └── 11_gradcam_explainability.png
+├── training/
+│   ├── train_baseline.py             # Script to build & save the baseline Logistic Regression model (.pkl)
+│   ├── train_mobilenet.py            # Script to train & save the MobileNetV2 deep learning model (.pth)
+│   └── README.md                     # Training documentation & CLI options
 ├── ui/
 │   └── app.py                        # Streamlit Interactive Web Application
 ├── utils/
@@ -121,14 +125,24 @@ Brain-Tumor-MRI-Detection/
 pip install -r requirements.txt
 ```
 
-### 2. View or Execute the Master Pipeline Notebook
+### 2. Train Models from Scratch (Optional)
+Train both models independently using the standalone training scripts:
+```bash
+# Train the Baseline Logistic Regression Model (.pkl)
+python training/train_baseline.py
+
+# Train the Advanced MobileNetV2 Deep Learning Model (.pth)
+python training/train_mobilenet.py --epochs 15 --batch_size 32
+```
+
+### 3. View or Execute the Master Pipeline Notebook
 Open the notebook in Jupyter or VS Code:
 ```bash
 jupyter notebook notebooks/Brain_Tumor_Detection_Pipeline.ipynb
 ```
 *All cells, outputs, evaluation tables, and figures are fully pre-rendered and verified.*
 
-### 3. Launch the Interactive Web Application
+### 4. Launch the Interactive Web Application
 Run the Streamlit application from the root directory:
 ```bash
 streamlit run ui/app.py
